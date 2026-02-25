@@ -634,10 +634,18 @@ async def cb_main_menu(call: CallbackQuery):
 
 
 async def _apply_parsed(status: Message, parsed: dict, state: FSMContext, schedule: list[dict]):
-    """Проверяет дубли предмета — если есть, спрашивает день; иначе сразу добавляет."""
+    """Проверяет совпадения предмета в расписании и добавляет ДЗ."""
     subject  = parsed.get("subject", "Неизвестно")
     task     = parsed.get("task", "")
     matching = _find_subject_days(subject, schedule)
+
+    if len(matching) == 0:
+        await status.edit_text(
+            f"Предмет <b>{subject}</b> не найден в расписании.\n"
+            "Проверь расписание командой /my_schedule.",
+            parse_mode="HTML",
+        )
+        return
 
     if len(matching) > 1:
         await state.set_state(HomeworkConfirm.choosing_day)
@@ -651,6 +659,9 @@ async def _apply_parsed(status: Message, parsed: dict, state: FSMContext, schedu
         )
         return
 
+    # Ровно 1 совпадение — берём день/время из расписания, а не от Mistral
+    parsed["due_lesson_day"]  = matching[0]["day_of_week"]
+    parsed["due_lesson_time"] = matching[0]["start_time"]
     await _do_add_to_calendar(status, parsed)
 
 
