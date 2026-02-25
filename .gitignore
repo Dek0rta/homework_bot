@@ -1,0 +1,8 @@
+.env
+data/
+__pycache__/
+*.pyc
+*.pyo
+=1.0.0
+.replit
+start.bat

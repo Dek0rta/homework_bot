@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(echo OK — синтаксических ошибок нет:*)",
+      "Bash(echo OK:*)",
+      "Bash(head:*)",
+      "Bash(tasklist:*)",
+      "Bash(python:*)",
+      "Bash(tail:*)",
+      "Bash(uncompyle6:*)",
+      "Bash(which replit:*)"
+    ]
+  }
+}
