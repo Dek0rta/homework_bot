@@ -1189,16 +1189,17 @@ async def cb_hw_stats(call: CallbackQuery):
 @router.message(F.text == BTN_STATS, F.chat.type == "private")
 async def cmd_stats_private(message: Message):
     await safe_delete(message)
-    user_id   = message.from_user.id
-    group_ids = db.get_groups_for_owner(user_id)
+    user_id = message.from_user.id
+
+    # Сначала ищем группы где пользователь — владелец расписания,
+    # иначе берём любую группу с данными (для обычных учеников класса)
+    group_ids = db.get_groups_for_owner(user_id) or db.get_all_group_chat_ids()
 
     if not group_ids:
         await message.answer(
             "📊 <b>Нагрузка класса</b>\n\n"
-            "Данных пока нет. Добавь бота в классный чат, затем:\n"
-            "1. /setup_subjects — укажи предметы\n"
-            "2. /link_schedule — привяжи своё расписание\n\n"
-            "После этого бот начнёт собирать статистику нагрузки.",
+            "Данных пока нет — бот ещё не добавлен в классный чат.\n\n"
+            "Попроси администратора добавить бота в беседу и выполнить /setup_subjects.",
             parse_mode="HTML",
             reply_markup=MAIN_KB,
         )
@@ -1207,7 +1208,7 @@ async def cmd_stats_private(message: Message):
     status = await message.answer("📊 Генерирую график нагрузки...")
     try:
         chat_id   = group_ids[0]
-        img_bytes = analytics.generate_weekly_chart(chat_id, "Мой класс")
+        img_bytes = analytics.generate_weekly_chart(chat_id, "Класс")
         await safe_delete(status)
         await message.answer_photo(
             BufferedInputFile(img_bytes, filename="load.png"),

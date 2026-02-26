@@ -123,6 +123,21 @@ def get_groups_for_owner(owner_id: int) -> list[int]:
     return rows
 
 
+def get_all_group_chat_ids() -> list[int]:
+    """
+    Возвращает все chat_id групп у которых есть хоть какие-то данные
+    (предметы или метрики нагрузки). Используется как фолбэк в личном чате.
+    """
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT DISTINCT chat_id FROM chat_subjects "
+        "UNION "
+        "SELECT DISTINCT tenant_id FROM daily_load_metrics"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
 def get_chat_homework(chat_id: int) -> list[dict]:
     conn = get_connection()
     cur = conn.execute(
