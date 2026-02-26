@@ -226,64 +226,124 @@ def _make_backup_json() -> str:
     return json.dumps(db.export_critical_data(), ensure_ascii=False, separators=(",", ":"))
 
 
-async def _notify_admin_backup(bot) -> None:
-    """Отправляет обновлённый бэкап администратору (если задан ADMIN_USER_ID)."""
-    if not ADMIN_USER_ID:
-        return
-    try:
-        backup_json = _make_backup_json()
-        data        = json.loads(backup_json)
-        n_lessons   = len(data.get("schedule", []))
-        n_subj      = len(data.get("chat_subjects", []))
+async def _push_backup_to_railway(backup_json: str) -> bool:
+    """
+    Автоматически обновляет переменную SCHEDULE_BACKUP в Railway через GraphQL API.
+    Требует только переменную RAILWAY_TOKEN (остальные Railway вводит сам).
+    Возвращает True при успехе.
+    """
+    import urllib.request as _req
 
-        text = (
-            "💾 <b>Резервная копия обновлена</b>\n\n"
-            f"Уроков: <b>{n_lessons}</b>  |  Предметов в группах: <b>{n_subj}</b>\n\n"
-            "Чтобы данные не слетали при редеплое, установи в Railway:\n"
-            "<b>Settings → Variables → New Variable</b>\n\n"
-            f"<code>SCHEDULE_BACKUP={backup_json}</code>"
-        )
-        # Если JSON длиннее лимита — шлём как файл
-        if len(text) > 4000:
-            await bot.send_document(
-                ADMIN_USER_ID,
-                BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
-                caption="💾 Резервная копия обновлена. Сохрани файл как env var SCHEDULE_BACKUP.",
+    token      = os.getenv("RAILWAY_TOKEN")
+    project_id = os.getenv("RAILWAY_PROJECT_ID")
+    env_id     = os.getenv("RAILWAY_ENVIRONMENT_ID")
+    service_id = os.getenv("RAILWAY_SERVICE_ID")
+
+    if not all([token, project_id, env_id, service_id]):
+        return False  # не Railway-окружение или токен не задан
+
+    payload = json.dumps({
+        "query": "mutation($i:VariableUpsertInput!){variableUpsert(input:$i)}",
+        "variables": {"i": {
+            "projectId":     project_id,
+            "environmentId": env_id,
+            "serviceId":     service_id,
+            "name":          "SCHEDULE_BACKUP",
+            "value":         backup_json,
+        }},
+    }).encode()
+
+    request = _req.Request(
+        "https://backboard.railway.app/graphql/v2",
+        data=payload,
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+    )
+    try:
+        loop   = asyncio.get_running_loop()
+        body   = await loop.run_in_executor(None, lambda: _req.urlopen(request, timeout=10).read())
+        result = json.loads(body)
+        if "errors" not in result:
+            logger.info("✅ SCHEDULE_BACKUP автоматически обновлён в Railway")
+            return True
+        logger.warning("Railway API вернул ошибку: %s", result["errors"])
+    except Exception as e:
+        logger.warning("Railway API недоступен: %s", e)
+    return False
+
+
+async def _save_backup(bot) -> None:
+    """
+    Сохраняет бэкап после изменения расписания:
+    1. Пробует обновить SCHEDULE_BACKUP через Railway API (если есть RAILWAY_TOKEN).
+    2. Если не вышло — отправляет JSON пользователю в ЛС (если есть ADMIN_USER_ID).
+    3. В любом случае пишет JSON в лог Railway (виден в Deployments → Logs).
+    """
+    backup_json = _make_backup_json()
+    data        = json.loads(backup_json)
+    n_lessons   = len(data.get("schedule", []))
+    n_subj      = len(data.get("chat_subjects", []))
+
+    # Шаг 1: автообновление в Railway
+    railway_ok = await _push_backup_to_railway(backup_json)
+
+    # Шаг 2: сообщение в ЛС администратору
+    if not railway_ok and ADMIN_USER_ID:
+        try:
+            text = (
+                "💾 <b>Сохрани резервную копию!</b>\n\n"
+                f"Уроков: <b>{n_lessons}</b>  |  Предметов: <b>{n_subj}</b>\n\n"
+                "Скопируй и вставь в Railway → Variables → <code>SCHEDULE_BACKUP</code>:\n\n"
+                f"<code>{backup_json}</code>"
             )
-        else:
-            await bot.send_message(ADMIN_USER_ID, text, parse_mode="HTML")
-    except Exception:
-        logger.warning("Не удалось отправить бэкап администратору (убедись, что написал боту в ЛС)")
+            if len(text) <= 4096:
+                await bot.send_message(ADMIN_USER_ID, text, parse_mode="HTML")
+            else:
+                await bot.send_document(
+                    ADMIN_USER_ID,
+                    BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
+                    caption="💾 Резервная копия. Сохрани содержимое файла как SCHEDULE_BACKUP в Railway Variables.",
+                )
+        except Exception:
+            pass  # бот заблокирован — лог ниже покроет
+
+    # Шаг 3: всегда пишем в лог (виден в Railway Deployments → Logs)
+    if not railway_ok:
+        logger.info("SCHEDULE_BACKUP_VALUE=%s", backup_json)
 
 
 @router.message(Command("backup"), F.chat.type == "private")
 async def cmd_backup(message: Message):
-    """Команда /backup — отдаёт текущий бэкап данных (только для ADMIN_USER_ID)."""
-    if ADMIN_USER_ID and message.from_user.id != ADMIN_USER_ID:
-        return  # молча игнорируем для не-администраторов
-
+    """Команда /backup — текущий бэкап расписания. Доступна всем пользователям."""
     backup_json = _make_backup_json()
     data        = json.loads(backup_json)
     n_lessons   = len(data.get("schedule", []))
     n_subj      = len(data.get("chat_subjects", []))
 
     if not n_lessons and not n_subj:
-        await message.answer("База данных пуста — нечего резервировать.", reply_markup=MAIN_KB)
+        await message.answer(
+            "База данных пуста.\n"
+            "Сначала настрой расписание, потом используй /backup для сохранения.",
+            reply_markup=MAIN_KB,
+        )
         return
 
-    caption = (
-        f"💾 <b>Резервная копия</b>\n\n"
-        f"Уроков: <b>{n_lessons}</b>  |  Предметов в группах: <b>{n_subj}</b>\n\n"
-        "Установи в Railway <b>Settings → Variables</b>:\n"
-        "Имя: <code>SCHEDULE_BACKUP</code>\n"
-        "Значение: содержимое этого файла"
+    text = (
+        f"💾 <b>Резервная копия</b>  ({n_lessons} уроков)\n\n"
+        "Скопируй строку ниже и вставь в Railway:\n"
+        "<b>Variables → New Variable</b>\n"
+        f"Имя: <code>SCHEDULE_BACKUP</code>\n\n"
+        f"<code>{backup_json}</code>"
     )
-    await message.answer_document(
-        BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
-        caption=caption,
-        parse_mode="HTML",
-        reply_markup=MAIN_KB,
-    )
+
+    if len(text) <= 4096:
+        await message.answer(text, parse_mode="HTML", reply_markup=MAIN_KB)
+    else:
+        # Для очень большого расписания — файл
+        await message.answer_document(
+            BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
+            caption=f"💾 Резервная копия ({n_lessons} уроков). Сохрани как SCHEDULE_BACKUP в Railway Variables.",
+            reply_markup=MAIN_KB,
+        )
 
 
 # ──────────────────────────────────────────────
@@ -492,7 +552,7 @@ async def cb_save_schedule(call: CallbackQuery, state: FSMContext):
 
     db.save_schedule(call.from_user.id, entries)
     await state.clear()
-    asyncio.create_task(_notify_admin_backup(call.bot))
+    asyncio.create_task(_save_backup(call.bot))
 
     # Формируем красивый итог по дням
     by_day: dict[int, list] = {}
