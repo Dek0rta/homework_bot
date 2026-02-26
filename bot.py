@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 import logging
 import os
 import tempfile
@@ -29,7 +30,7 @@ import analytics
 import db
 import gemini
 import schedule as sched_module
-from config import BOT_TOKEN, FSM_PATH
+from config import ADMIN_USER_ID, BOT_TOKEN, FSM_PATH
 from storage import JsonStorage
 
 
@@ -215,6 +216,74 @@ def kb_hw_due_day(hw_key: int, entries: list[dict] | None = None) -> InlineKeybo
 
     rows.append([InlineKeyboardButton(text="📆 Без даты", callback_data=f"hw|cd|{hw_key}|none")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ──────────────────────────────────────────────
+# Резервное копирование данных
+# ──────────────────────────────────────────────
+
+def _make_backup_json() -> str:
+    return json.dumps(db.export_critical_data(), ensure_ascii=False, separators=(",", ":"))
+
+
+async def _notify_admin_backup(bot) -> None:
+    """Отправляет обновлённый бэкап администратору (если задан ADMIN_USER_ID)."""
+    if not ADMIN_USER_ID:
+        return
+    try:
+        backup_json = _make_backup_json()
+        data        = json.loads(backup_json)
+        n_lessons   = len(data.get("schedule", []))
+        n_subj      = len(data.get("chat_subjects", []))
+
+        text = (
+            "💾 <b>Резервная копия обновлена</b>\n\n"
+            f"Уроков: <b>{n_lessons}</b>  |  Предметов в группах: <b>{n_subj}</b>\n\n"
+            "Чтобы данные не слетали при редеплое, установи в Railway:\n"
+            "<b>Settings → Variables → New Variable</b>\n\n"
+            f"<code>SCHEDULE_BACKUP={backup_json}</code>"
+        )
+        # Если JSON длиннее лимита — шлём как файл
+        if len(text) > 4000:
+            await bot.send_document(
+                ADMIN_USER_ID,
+                BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
+                caption="💾 Резервная копия обновлена. Сохрани файл как env var SCHEDULE_BACKUP.",
+            )
+        else:
+            await bot.send_message(ADMIN_USER_ID, text, parse_mode="HTML")
+    except Exception:
+        logger.warning("Не удалось отправить бэкап администратору (убедись, что написал боту в ЛС)")
+
+
+@router.message(Command("backup"), F.chat.type == "private")
+async def cmd_backup(message: Message):
+    """Команда /backup — отдаёт текущий бэкап данных (только для ADMIN_USER_ID)."""
+    if ADMIN_USER_ID and message.from_user.id != ADMIN_USER_ID:
+        return  # молча игнорируем для не-администраторов
+
+    backup_json = _make_backup_json()
+    data        = json.loads(backup_json)
+    n_lessons   = len(data.get("schedule", []))
+    n_subj      = len(data.get("chat_subjects", []))
+
+    if not n_lessons and not n_subj:
+        await message.answer("База данных пуста — нечего резервировать.", reply_markup=MAIN_KB)
+        return
+
+    caption = (
+        f"💾 <b>Резервная копия</b>\n\n"
+        f"Уроков: <b>{n_lessons}</b>  |  Предметов в группах: <b>{n_subj}</b>\n\n"
+        "Установи в Railway <b>Settings → Variables</b>:\n"
+        "Имя: <code>SCHEDULE_BACKUP</code>\n"
+        "Значение: содержимое этого файла"
+    )
+    await message.answer_document(
+        BufferedInputFile(backup_json.encode(), filename="schedule_backup.json"),
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=MAIN_KB,
+    )
 
 
 # ──────────────────────────────────────────────
@@ -423,6 +492,7 @@ async def cb_save_schedule(call: CallbackQuery, state: FSMContext):
 
     db.save_schedule(call.from_user.id, entries)
     await state.clear()
+    asyncio.create_task(_notify_admin_backup(call.bot))
 
     # Формируем красивый итог по дням
     by_day: dict[int, list] = {}
@@ -1302,6 +1372,15 @@ async def main():
     db.init_db()
     analytics.migrate_analytics_schema()
 
+    # Автовосстановление из резервной копии (если БД пуста после редеплоя)
+    backup_env = os.getenv("SCHEDULE_BACKUP")
+    if backup_env and db.is_db_empty():
+        try:
+            count = db.import_critical_data(json.loads(backup_env))
+            logger.info("✅ Восстановлено %d записей из SCHEDULE_BACKUP", count)
+        except Exception:
+            logger.exception("❌ Ошибка восстановления из SCHEDULE_BACKUP")
+
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=JsonStorage(FSM_PATH))
     dp.include_router(router)
@@ -1311,6 +1390,7 @@ async def main():
         BotCommand(command="schedule",    description="Изменить расписание"),
         BotCommand(command="my_schedule", description="Посмотреть расписание"),
         BotCommand(command="stats",       description="График нагрузки класса"),
+        BotCommand(command="backup",      description="Резервная копия расписания"),
         BotCommand(command="auth",        description="Подключить Google Calendar"),
         BotCommand(command="cancel",      description="Отменить текущее действие"),
         BotCommand(command="help",        description="Справка по командам"),

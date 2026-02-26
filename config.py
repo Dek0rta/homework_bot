@@ -12,9 +12,16 @@ CALENDAR_ID     = os.getenv("CALENDAR_ID", "primary")
 TIMEZONE        = os.getenv("TIMEZONE", "Europe/Moscow")
 
 # Директория для хранения данных.
-# Локально: "data/" (по умолчанию)
-# Railway:  задай переменную DATA_DIR=/data и подключи Volume с mount path = /data
-_DATA_DIR = os.getenv("DATA_DIR", "data")
+# Приоритет: 1) env var DATA_DIR  2) автодетект /data (Railway Volume)  3) локальная ./data/
+def _detect_data_dir() -> str:
+    if explicit := os.getenv("DATA_DIR"):
+        return explicit
+    # Railway Volume автоматически монтируется в /data — используем без env var
+    if os.path.isdir("/data") and os.access("/data", os.W_OK):
+        return "/data"
+    return "data"
+
+_DATA_DIR = _detect_data_dir()
 
 DB_PATH          = os.path.join(_DATA_DIR, "homework.db")
 TOKEN_PATH       = os.path.join(_DATA_DIR, "token.json")

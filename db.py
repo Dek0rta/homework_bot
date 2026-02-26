@@ -190,6 +190,85 @@ def get_chat_schedule_owner(chat_id: int) -> int | None:
     return row["schedule_owner_id"] if row else None
 
 
+def is_db_empty() -> bool:
+    """True если в БД нет ни одного расписания и ни одного предмета группы."""
+    conn = get_connection()
+    has_sched = conn.execute("SELECT 1 FROM schedule LIMIT 1").fetchone()
+    has_subj  = conn.execute("SELECT 1 FROM chat_subjects LIMIT 1").fetchone()
+    conn.close()
+    return not has_sched and not has_subj
+
+
+def export_critical_data() -> dict:
+    """
+    Экспортирует критические данные (расписание, предметы групп, конфиг)
+    в словарь для сохранения как env var SCHEDULE_BACKUP.
+    Намеренно НЕ включает chat_homework — ДЗ эфемерны по природе.
+    """
+    conn = get_connection()
+    data = {
+        "version": 2,
+        "schedule": [
+            dict(r) for r in conn.execute(
+                "SELECT user_id, day_of_week, subject, start_time FROM schedule"
+            ).fetchall()
+        ],
+        "chat_subjects": [
+            dict(r) for r in conn.execute(
+                "SELECT chat_id, subject FROM chat_subjects"
+            ).fetchall()
+        ],
+        "chat_config": [
+            dict(r) for r in conn.execute(
+                "SELECT chat_id, schedule_owner_id FROM chat_config"
+            ).fetchall()
+        ],
+    }
+    conn.close()
+    return data
+
+
+def import_critical_data(data: dict) -> int:
+    """
+    Восстанавливает данные из словаря (результат export_critical_data).
+    Возвращает количество вставленных записей. Дубликаты игнорируются.
+    """
+    if not isinstance(data, dict) or data.get("version") not in (1, 2):
+        return 0
+
+    conn = get_connection()
+    total = 0
+
+    schedule = data.get("schedule", [])
+    if schedule:
+        conn.executemany(
+            "INSERT OR IGNORE INTO schedule (user_id, day_of_week, subject, start_time)"
+            " VALUES (?, ?, ?, ?)",
+            [(r["user_id"], r["day_of_week"], r["subject"], r["start_time"]) for r in schedule],
+        )
+        total += len(schedule)
+
+    subjects = data.get("chat_subjects", [])
+    if subjects:
+        conn.executemany(
+            "INSERT OR IGNORE INTO chat_subjects (chat_id, subject) VALUES (?, ?)",
+            [(r["chat_id"], r["subject"]) for r in subjects],
+        )
+        total += len(subjects)
+
+    config = data.get("chat_config", [])
+    if config:
+        conn.executemany(
+            "INSERT OR IGNORE INTO chat_config (chat_id, schedule_owner_id) VALUES (?, ?)",
+            [(r["chat_id"], r["schedule_owner_id"]) for r in config],
+        )
+        total += len(config)
+
+    conn.commit()
+    conn.close()
+    return total
+
+
 def set_chat_subjects(chat_id: int, subjects: list[str]):
     conn = get_connection()
     conn.execute("DELETE FROM chat_subjects WHERE chat_id = ?", (chat_id,))
