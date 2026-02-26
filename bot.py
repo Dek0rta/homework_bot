@@ -29,7 +29,7 @@ import analytics
 import db
 import gemini
 import schedule as sched_module
-from config import BOT_TOKEN
+from config import BOT_TOKEN, FSM_PATH
 from storage import JsonStorage
 
 
@@ -1303,7 +1303,7 @@ async def main():
     analytics.migrate_analytics_schema()
 
     bot = Bot(token=BOT_TOKEN)
-    dp  = Dispatcher(storage=JsonStorage("data/fsm.json"))
+    dp  = Dispatcher(storage=JsonStorage(FSM_PATH))
     dp.include_router(router)
 
     await bot.set_my_commands([
