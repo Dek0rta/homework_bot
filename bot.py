@@ -893,9 +893,9 @@ async def handle_photo(message: Message, state: FSMContext):
         os.unlink(tmp_path)
 
 
-@router.message(F.chat.type == "private", F.text & ~F.text.startswith("/"))
+@router.message(F.chat.type == "private", F.text & ~F.text.startswith("/") & ~F.text.in_(BUTTON_TEXTS))
 async def handle_text(message: Message, state: FSMContext):
-    if message.text in BUTTON_TEXTS or await state.get_state() is not None:
+    if await state.get_state() is not None:
         return
     await process_homework(message, message.text, state)
 
