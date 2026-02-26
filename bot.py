@@ -13,6 +13,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -24,6 +25,7 @@ from aiogram.types import (
 )
 
 import calendar_api
+import analytics
 import db
 import gemini
 import schedule as sched_module
@@ -78,12 +80,13 @@ LESSON_TIMES = [
 BTN_SCHEDULE     = "📅 Моё расписание"
 BTN_SET_SCHEDULE = "✏️ Изменить расписание"
 BTN_CALENDAR     = "🔗 Google Calendar"
-BUTTON_TEXTS     = {BTN_SCHEDULE, BTN_SET_SCHEDULE, BTN_CALENDAR}
+BTN_STATS        = "📊 Нагрузка"
+BUTTON_TEXTS     = {BTN_SCHEDULE, BTN_SET_SCHEDULE, BTN_CALENDAR, BTN_STATS}
 
 MAIN_KB = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_SET_SCHEDULE), KeyboardButton(text=BTN_SCHEDULE)],
-        [KeyboardButton(text=BTN_CALENDAR)],
+        [KeyboardButton(text=BTN_CALENDAR),     KeyboardButton(text=BTN_STATS)],
     ],
     resize_keyboard=True,
     input_field_placeholder="Отправь фото или текст с ДЗ...",
@@ -230,7 +233,8 @@ async def cmd_start(message: Message):
         "<b>Команды:</b>\n"
         "/schedule — редактор расписания\n"
         "/my_schedule — посмотреть расписание\n"
-        "/auth — подключить Google Calendar",
+        "/auth — подключить Google Calendar\n"
+        "/stats — график нагрузки класса",
         parse_mode="HTML",
         reply_markup=MAIN_KB,
     )
@@ -688,6 +692,20 @@ async def cb_pick_hw_day(call: CallbackQuery, state: FSMContext):
     await _do_add_to_calendar(status, parsed)
 
 
+async def _analyze_hw_async(chat_id: int, hw_id: int, subject: str, task: str, due_date: str) -> None:
+    """
+    Фоновый анализ сложности ДЗ через LLM.
+    Не блокирует ответ пользователю — ошибки логируются и игнорируются.
+    """
+    try:
+        est_time = await analytics.estimate_hw_time(subject, task)
+        if est_time is not None:
+            db.update_hw_estimated_time(hw_id, est_time)
+        analytics.update_daily_metrics(chat_id, due_date)
+    except Exception:
+        logger.exception("Background analytics error for hw_id=%d", hw_id)
+
+
 async def process_homework(message: Message, text: str, state: FSMContext):
     await safe_delete(message)
 
@@ -923,6 +941,10 @@ def _build_hw_list(homework: list[dict], group_chat_id: int) -> tuple[str, Inlin
         text="🗑 Очистить всё",
         callback_data=f"hw|clear_all|{group_chat_id}",
     )])
+    del_rows.append([InlineKeyboardButton(
+        text="📊 Нагрузка класса",
+        callback_data=f"hw|stats|{group_chat_id}",
+    )])
 
     return text, InlineKeyboardMarkup(inline_keyboard=del_rows)
 
@@ -1047,14 +1069,145 @@ async def cb_confirm_hw_day(call: CallbackQuery):
         due_date = d.strftime("%Y-%m-%d")
         due_text = f"\n📅 Сдать: <b>{_fmt_due_date(due_date)}</b>"
 
-    db.save_chat_homework(pending["chat_id"], pending["subject"], pending["task"], due_date)
+    hw_id = db.save_chat_homework(pending["chat_id"], pending["subject"], pending["task"], due_date)
+
+    # Запускаем фоновый анализ сложности (не блокируем пользователя)
+    if due_date:
+        asyncio.create_task(_analyze_hw_async(
+            pending["chat_id"], hw_id, pending["subject"], pending["task"], due_date,
+        ))
+
+    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Нагрузка класса", callback_data=f"hw|stats|{pending['chat_id']}"),
+    ]])
 
     msg = await call.message.edit_text(
         f"📚 <b>ДЗ сохранено</b>\n"
         f"<b>{pending['subject']}</b> — {pending['task']}{due_text}",
         parse_mode="HTML",
+        reply_markup=kb_confirm,
     )
-    asyncio.create_task(_delete_after(msg))
+    asyncio.create_task(_delete_after(msg, delay=20))
+
+
+# ── Аналитика нагрузки — inline-кнопка из /hw или подтверждения ──────────────
+
+@router.callback_query(F.data.startswith("hw|stats|"))
+async def cb_hw_stats(call: CallbackQuery):
+    await call.answer()
+    chat_id    = int(call.data.split("|")[2])
+    chat_title = getattr(call.message.chat, "title", None) or "Класс"
+    try:
+        img_bytes = analytics.generate_weekly_chart(chat_id, chat_title)
+        await call.message.answer_photo(
+            BufferedInputFile(img_bytes, filename="load.png"),
+            caption=(
+                "📊 <b>Нагрузка класса на 2 недели</b>\n\n"
+                "🟢 В норме  🟠 Повышенная  🔴 Перегрузка\n"
+                "Пунктир — безопасная норма (3 ч/день)"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("cb_hw_stats error")
+        await call.message.answer("Ошибка генерации графика. Попробуй позже.")
+
+
+# ── /stats — график нагрузки (личный чат) ────────────────────────────────────
+
+@router.message(Command("stats"), F.chat.type == "private")
+@router.message(F.text == BTN_STATS, F.chat.type == "private")
+async def cmd_stats_private(message: Message):
+    await safe_delete(message)
+    user_id   = message.from_user.id
+    group_ids = db.get_groups_for_owner(user_id)
+
+    if not group_ids:
+        await message.answer(
+            "📊 <b>Нагрузка класса</b>\n\n"
+            "Данных пока нет. Добавь бота в классный чат, затем:\n"
+            "1. /setup_subjects — укажи предметы\n"
+            "2. /link_schedule — привяжи своё расписание\n\n"
+            "После этого бот начнёт собирать статистику нагрузки.",
+            parse_mode="HTML",
+            reply_markup=MAIN_KB,
+        )
+        return
+
+    status = await message.answer("📊 Генерирую график нагрузки...")
+    try:
+        chat_id   = group_ids[0]
+        img_bytes = analytics.generate_weekly_chart(chat_id, "Мой класс")
+        await safe_delete(status)
+        await message.answer_photo(
+            BufferedInputFile(img_bytes, filename="load.png"),
+            caption=(
+                "📊 <b>Нагрузка класса на 2 недели</b>\n\n"
+                "🟢 В норме  🟠 Повышенная  🔴 Перегрузка\n"
+                "Пунктир — безопасная норма (3 ч/день)\n\n"
+                "<i>Данные анонимизированы — имена учеников не сохраняются.</i>"
+            ),
+            parse_mode="HTML",
+            reply_markup=MAIN_KB,
+        )
+    except Exception:
+        logger.exception("Private stats error")
+        await status.edit_text("Ошибка генерации графика. Попробуй позже.")
+
+
+# ── /stats — график нагрузки (группа / канал) ────────────────────────────────
+
+@router.message(Command("stats"), F.chat.type.in_(_GROUP_TYPES))
+@router.channel_post(Command("stats"))
+async def cmd_stats_group(message: Message):
+    await safe_delete(message)
+    status = await message.answer("📊 Генерирую график нагрузки...")
+    try:
+        chat_id    = message.chat.id
+        chat_title = getattr(message.chat, "title", None) or "Класс"
+        img_bytes  = analytics.generate_weekly_chart(chat_id, chat_title)
+        await safe_delete(status)
+        await message.answer_photo(
+            BufferedInputFile(img_bytes, filename="load.png"),
+            caption=(
+                "📊 <b>Нагрузка класса на 2 недели</b>\n\n"
+                "🟢 В норме  🟠 Повышенная  🔴 Перегрузка\n"
+                "Пунктир — безопасная норма (3 ч/день)"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Group stats error")
+        await status.edit_text("Ошибка генерации графика. Попробуй позже.")
+
+
+# ── /export_csv — экспорт метрик в CSV (только admin) ───────────────────────
+
+@router.message(Command("export_csv"), F.chat.type.in_(_GROUP_TYPES))
+@router.channel_post(Command("export_csv"))
+async def cmd_export_csv(message: Message):
+    if message.from_user and message.chat.type in _GROUP_TYPES:
+        if not await _is_chat_admin(message.bot, message.chat.id, message.from_user.id):
+            await message.reply("Только администраторы могут экспортировать данные.")
+            return
+
+    await safe_delete(message)
+    try:
+        csv_bytes  = analytics.export_csv(message.chat.id)
+        today_str  = datetime.today().strftime("%Y%m%d")
+        await message.answer_document(
+            BufferedInputFile(csv_bytes, filename=f"load_{today_str}.csv"),
+            caption=(
+                "📊 <b>Экспорт данных о нагрузке</b>\n\n"
+                "Колонки: date, task_count, total_time_minutes, total_time_hours, stress_index\n\n"
+                "<i>Файл содержит только агрегированные данные класса.\n"
+                "Имена учеников и user_id не включены.</i>"
+            ),
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Export CSV error")
+        await message.answer("Ошибка при экспорте данных.")
 
 
 # ── Справка (/help) ───────────────────────────────────────────────────────────
@@ -1069,6 +1222,7 @@ async def cmd_help(message: Message):
             "/schedule — редактор расписания по дням\n"
             "/my_schedule — посмотреть своё расписание\n"
             "/auth — подключить Google Calendar\n"
+            "/stats — график нагрузки класса\n"
             "/cancel — отменить текущее действие\n\n"
             "<b>Как пользоваться:</b>\n"
             "1. Настрой расписание — /schedule\n"
@@ -1088,6 +1242,8 @@ async def cmd_help(message: Message):
         await message.reply(
             "📚 <b>Команды (группа / канал)</b>\n\n"
             "/hw — список домашних заданий\n"
+            "/stats — график нагрузки класса на 2 недели\n"
+            "/export_csv — экспорт метрик нагрузки в CSV <i>(только admin)</i>\n"
             "/setup_subjects — настроить предметы <i>(только admin)</i>\n"
             "/link_schedule — привязать своё расписание <i>(только admin)</i>\n"
             "/clear_hw — очистить список ДЗ <i>(только admin)</i>\n"
@@ -1144,6 +1300,7 @@ async def _start_keepalive():
 
 async def main():
     db.init_db()
+    analytics.migrate_analytics_schema()
 
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=JsonStorage("data/fsm.json"))
@@ -1153,12 +1310,15 @@ async def main():
         BotCommand(command="start",       description="Главное меню"),
         BotCommand(command="schedule",    description="Изменить расписание"),
         BotCommand(command="my_schedule", description="Посмотреть расписание"),
+        BotCommand(command="stats",       description="График нагрузки класса"),
         BotCommand(command="auth",        description="Подключить Google Calendar"),
         BotCommand(command="cancel",      description="Отменить текущее действие"),
         BotCommand(command="help",        description="Справка по командам"),
     ], scope=BotCommandScopeAllPrivateChats())
     await bot.set_my_commands([
         BotCommand(command="hw",              description="Список домашних заданий"),
+        BotCommand(command="stats",           description="График нагрузки класса"),
+        BotCommand(command="export_csv",      description="Экспорт данных нагрузки в CSV"),
         BotCommand(command="setup_subjects",  description="Настроить предметы (только admin)"),
         BotCommand(command="link_schedule",   description="Привязать расписание к группе (только admin)"),
         BotCommand(command="clear_hw",        description="Очистить список ДЗ (только admin)"),

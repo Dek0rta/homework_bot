@@ -87,14 +87,40 @@ def has_schedule(user_id: int) -> bool:
 
 # ── Групповое ДЗ ────────────────────────────────────────────────────────────
 
-def save_chat_homework(chat_id: int, subject: str, task: str, due_date: str | None = None):
+def save_chat_homework(chat_id: int, subject: str, task: str, due_date: str | None = None) -> int:
+    """Сохраняет ДЗ и возвращает id новой записи."""
     conn = get_connection()
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO chat_homework (chat_id, subject, task, added_at, due_date) VALUES (?, ?, ?, ?, ?)",
         (chat_id, subject, task, datetime.now().strftime("%d.%m %H:%M"), due_date),
     )
+    hw_id = cur.lastrowid
     conn.commit()
     conn.close()
+    return hw_id
+
+
+def update_hw_estimated_time(hw_id: int, minutes: int) -> None:
+    """Сохраняет оценку времени (от LLM) для конкретного задания."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE chat_homework SET estimated_time_minutes=? WHERE id=?",
+        (minutes, hw_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_groups_for_owner(owner_id: int) -> list[int]:
+    """Возвращает chat_id всех групп, где owner_id — владелец расписания."""
+    conn = get_connection()
+    cur = conn.execute(
+        "SELECT chat_id FROM chat_config WHERE schedule_owner_id=?",
+        (owner_id,),
+    )
+    rows = [r["chat_id"] for r in cur.fetchall()]
+    conn.close()
+    return rows
 
 
 def get_chat_homework(chat_id: int) -> list[dict]:
