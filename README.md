@@ -171,7 +171,7 @@ python-dotenv
 Нужен похожий бот под ваши задачи?
 
 - **Telegram:** [@Dek0rta](https://t.me/Dek0rta)
-- **Авито:** [объявление]([https://avito.ru](https://www.avito.ru/bryansk/predlozheniya_uslug/telegram-bot_na_zakaz_razrabotka_pod_vashi_zadachi_7884576247?utm_campaign=native&utm_medium=item_page_ios&utm_source=soc_sharing_seller)
+- **Авито:** [объявление](https://www.avito.ru/bryansk/predlozheniya_uslug/telegram-bot_na_zakaz_razrabotka_pod_vashi_zadachi_7884576247?utm_campaign=native&utm_medium=item_page_ios&utm_source=soc_sharing_seller)
 
 > Разрабатываю Telegram-ботов на заказ: от простых до сложных с AI, OCR и интеграциями.
 
